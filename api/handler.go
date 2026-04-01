@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -10,29 +12,139 @@ import (
 	"github.com/coder/arr-tracker-sf/internal/salesforce"
 )
 
-// Handler wires together DB and Salesforce.
+// Handler wires together DB, Salesforce config, and session store.
 type Handler struct {
-	db *dbpkg.DB
-	sf *salesforce.Client
+	db       *dbpkg.DB
+	sfCfg    salesforce.Config
+	sessions *sessionStore
 }
 
-func New(db *dbpkg.DB, sf *salesforce.Client) *Handler {
-	return &Handler{db: db, sf: sf}
+func New(db *dbpkg.DB, sfCfg salesforce.Config, sessionSecret string) *Handler {
+	return &Handler{
+		db:       db,
+		sfCfg:    sfCfg,
+		sessions: newSessionStore(sessionSecret),
+	}
 }
 
 // RegisterRoutes attaches all HTTP routes to mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/health", h.health)
-	mux.HandleFunc("/api/summary", h.summary)
-	mux.HandleFunc("/api/contracts", h.contracts)
-	mux.HandleFunc("/api/sync", h.sync)
+	// Auth routes (no session required)
+	mux.HandleFunc("/auth/login", h.authLogin)
+	mux.HandleFunc("/auth/callback", h.authCallback)
+	mux.HandleFunc("/auth/logout", h.authLogout)
 
-	// Serve React frontend (embedded or from /web/dist)
+	// API routes (session required)
+	mux.HandleFunc("/api/health", h.requireAuth(h.health))
+	mux.HandleFunc("/api/summary", h.requireAuth(h.summary))
+	mux.HandleFunc("/api/contracts", h.requireAuth(h.contracts))
+	mux.HandleFunc("/api/sync", h.requireAuth(h.sync))
+
+	// Serve React frontend
 	mux.Handle("/", http.FileServer(http.Dir("./web/dist")))
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Auth handlers
+// ---------------------------------------------------------------------------
+
+func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request) {
+	state := randomState()
+	// Store state in a short-lived cookie for CSRF protection
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oauth_state",
+		Value:    state,
+		Path:     "/",
+		MaxAge:   300, // 5 minutes
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	sf := salesforce.New(h.sfCfg)
+	http.Redirect(w, r, sf.AuthCodeURL(state), http.StatusTemporaryRedirect)
+}
+
+func (h *Handler) authCallback(w http.ResponseWriter, r *http.Request) {
+	// Validate state
+	stateCookie, err := r.Cookie("oauth_state")
+	if err != nil || stateCookie.Value != r.URL.Query().Get("state") {
+		http.Error(w, "invalid oauth state", http.StatusBadRequest)
+		return
+	}
+	// Clear the state cookie
+	http.SetCookie(w, &http.Cookie{Name: "oauth_state", MaxAge: -1, Path: "/"})
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+
+	sf := salesforce.New(h.sfCfg)
+	tr, err := sf.ExchangeCode(code)
+	if err != nil {
+		log.Printf("ERROR: token exchange failed: %v", err)
+		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Store tokens in session
+	sess := &session{
+		AccessToken:  tr.AccessToken,
+		RefreshToken: tr.RefreshToken,
+		APIBase:      tr.InstanceURL,
+		CreatedAt:    time.Now(),
+	}
+	sessionID := h.sessions.create(sess)
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   86400 * 30, // 30 days
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+}
+
+func (h *Handler) authLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("session_id"); err == nil {
+		h.sessions.delete(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "session_id", MaxAge: -1, Path: "/"})
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+}
+
+// ---------------------------------------------------------------------------
+// Session middleware
+// ---------------------------------------------------------------------------
+
+func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("session_id")
+		if err != nil {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		if _, ok := h.sessions.get(c.Value); !ok {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// sfClient returns a Salesforce client for the current session.
+func (h *Handler) sfClient(r *http.Request) *salesforce.Client {
+	c, _ := r.Cookie("session_id")
+	sess, _ := h.sessions.get(c.Value)
+	return salesforce.NewWithTokens(h.sfCfg, sess.AccessToken, sess.RefreshToken, sess.APIBase)
+}
+
+// ---------------------------------------------------------------------------
+// API handlers
 // ---------------------------------------------------------------------------
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -49,11 +161,10 @@ func (h *Handler) summary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) contracts(w http.ResponseWriter, r *http.Request) {
-	stageFilter := r.URL.Query().Get("stage") // ALL | CLOSED_WON (default)
+	stageFilter := r.URL.Query().Get("stage")
 	if stageFilter == "" {
 		stageFilter = "CLOSED_WON"
 	}
-
 	contracts, err := h.db.ListContracts(stageFilter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -68,8 +179,9 @@ func (h *Handler) sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sf := h.sfClient(r)
 	full := r.URL.Query().Get("full") == "true"
-	upserted, total, err := h.runSync(!full)
+	upserted, total, err := h.runSync(sf, !full)
 	h.db.LogSync(upserted, total, !full, err) //nolint:errcheck
 
 	if err != nil {
@@ -87,9 +199,7 @@ func (h *Handler) sync(w http.ResponseWriter, r *http.Request) {
 // Sync logic
 // ---------------------------------------------------------------------------
 
-// runSync fetches from Salesforce and upserts to DB.
-// incremental=true means fetch only records modified since last sync.
-func (h *Handler) runSync(incremental bool) (upserted, total int, err error) {
+func (h *Handler) runSync(sf *salesforce.Client, incremental bool) (upserted, total int, err error) {
 	var since time.Time
 	if incremental {
 		since, err = h.db.LastSyncTime()
@@ -101,7 +211,7 @@ func (h *Handler) runSync(incremental bool) (upserted, total int, err error) {
 
 	log.Printf("Starting sync (incremental=%v, since=%v)", incremental, since)
 
-	sfContracts, err := h.sf.FetchOpportunities(since)
+	sfContracts, err := salesforce.FetchOpportunities(sf, since)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -109,7 +219,6 @@ func (h *Handler) runSync(incremental bool) (upserted, total int, err error) {
 	total = len(sfContracts)
 	log.Printf("Fetched %d opportunities from Salesforce", total)
 
-	// Convert salesforce.Contract → db.Contract
 	dbContracts := make([]dbpkg.Contract, len(sfContracts))
 	for i, c := range sfContracts {
 		dbContracts[i] = dbpkg.Contract{
@@ -129,24 +238,14 @@ func (h *Handler) runSync(incremental bool) (upserted, total int, err error) {
 	return upserted, total, err
 }
 
-// ---------------------------------------------------------------------------
-// Background scheduler
-// ---------------------------------------------------------------------------
-
-func (h *Handler) StartScheduler() {
+// StartScheduler runs a background sync every 24 hours.
+// It requires a valid Salesforce client — call this after a user has logged in
+// and you have tokens, or skip it and rely on manual syncs from the UI.
+func (h *Handler) StartScheduler(sf *salesforce.Client) {
 	go func() {
-		// Initial sync on startup
-		upserted, total, err := h.runSync(false)
-		h.db.LogSync(upserted, total, false, err) //nolint:errcheck
-		if err != nil {
-			log.Printf("ERROR: initial sync failed: %v", err)
-		} else {
-			log.Printf("Initial sync complete: %d/%d upserted", upserted, total)
-		}
-
 		ticker := time.NewTicker(24 * time.Hour)
 		for range ticker.C {
-			upserted, total, err := h.runSync(true)
+			upserted, total, err := h.runSync(sf, true)
 			h.db.LogSync(upserted, total, true, err) //nolint:errcheck
 			if err != nil {
 				log.Printf("ERROR: scheduled sync failed: %v", err)
@@ -158,10 +257,51 @@ func (h *Handler) StartScheduler() {
 }
 
 // ---------------------------------------------------------------------------
+// Session store (in-memory)
+// ---------------------------------------------------------------------------
+
+type session struct {
+	AccessToken  string
+	RefreshToken string
+	APIBase      string
+	CreatedAt    time.Time
+}
+
+type sessionStore struct {
+	secret string
+	store  map[string]*session
+}
+
+func newSessionStore(secret string) *sessionStore {
+	return &sessionStore{secret: secret, store: map[string]*session{}}
+}
+
+func (s *sessionStore) create(sess *session) string {
+	id := randomState()
+	s.store[id] = sess
+	return id
+}
+
+func (s *sessionStore) get(id string) (*session, bool) {
+	sess, ok := s.store[id]
+	return sess, ok
+}
+
+func (s *sessionStore) delete(id string) {
+	delete(s.store, id)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v) //nolint:errcheck
+}
+
+func randomState() string {
+	b := make([]byte, 16)
+	rand.Read(b) //nolint:errcheck
+	return base64.URLEncoding.EncodeToString(b)
 }

@@ -11,14 +11,12 @@ import (
 )
 
 func main() {
-	// --- Config from environment ---
+	// --- Config ---
 	sfClientID := mustEnv("SF_CLIENT_ID")
 	sfClientSecret := mustEnv("SF_CLIENT_SECRET")
-	sfUsername := mustEnv("SF_USERNAME")
-	sfPassword := mustEnv("SF_PASSWORD")
-	sfSecurityToken := envOr("SF_SECURITY_TOKEN", "")
+	sfCallbackURL := mustEnv("SF_CALLBACK_URL")
 	sfInstanceURL := envOr("SF_INSTANCE_URL", "https://login.salesforce.com")
-
+	sessionSecret := mustEnv("SESSION_SECRET")
 	dbURL := mustEnv("DATABASE_URL")
 	port := envOr("PORT", "8080")
 
@@ -32,23 +30,19 @@ func main() {
 	}
 	log.Println("Database connected and migrated")
 
-	// --- Salesforce client ---
-	sf := salesforce.New(salesforce.Config{
+	// --- Salesforce config (no tokens yet — users log in via browser) ---
+	sfCfg := salesforce.Config{
 		ClientID:     sfClientID,
 		ClientSecret: sfClientSecret,
-		Username:     sfUsername,
-		Password:     sfPassword + sfSecurityToken,
+		CallbackURL:  sfCallbackURL,
 		InstanceURL:  sfInstanceURL,
-	})
+	}
 
 	// --- API handler ---
-	handler := api.New(database, sf)
+	handler := api.New(database, sfCfg, sessionSecret)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
-
-	// --- Background scheduler (24hr auto-sync) ---
-	handler.StartScheduler()
 
 	// --- Start server ---
 	addr := ":" + port

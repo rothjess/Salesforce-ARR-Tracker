@@ -14,14 +14,25 @@ const fmt = (n) =>
     : `$${n.toFixed(0)}`
 
 export default function App() {
+  const [authed, setAuthed]       = useState(null) // null = checking
   const [summary, setSummary]     = useState(null)
   const [contracts, setContracts] = useState([])
   const [loading, setLoading]     = useState(true)
   const [syncing, setSyncing]     = useState(false)
   const [syncMsg, setSyncMsg]     = useState('')
   const [search, setSearch]       = useState('')
-  const [sortKey, setSortKey]     = useState('arr')
+  const [sortKey, setSortKey]     = useState('ARR')
   const [sortDir, setSortDir]     = useState('desc')
+
+  // Check auth by hitting a protected endpoint
+  const checkAuth = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/health`)
+      setAuthed(r.ok)
+    } catch {
+      setAuthed(false)
+    }
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -39,7 +50,13 @@ export default function App() {
     }
   }, [])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    checkAuth().then(() => {})
+  }, [checkAuth])
+
+  useEffect(() => {
+    if (authed) load()
+  }, [authed, load])
 
   const doSync = async (full = false) => {
     setSyncing(true)
@@ -56,7 +73,6 @@ export default function App() {
     }
   }
 
-  // Sort + filter
   const filtered = (contracts || [])
     .filter(c =>
       !search ||
@@ -65,28 +81,47 @@ export default function App() {
     )
     .sort((a, b) => {
       let av = a[sortKey] ?? 0, bv = b[sortKey] ?? 0
-      if (typeof av === 'string') av = av.toLowerCase()
-      if (typeof bv === 'string') bv = bv.toLowerCase()
+      if (typeof av === 'string') { av = av.toLowerCase(); bv = bv.toLowerCase() }
       return sortDir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1)
     })
 
-  const toggleSort = (key) => {
-    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    else { setSortKey(key); setSortDir('desc') }
-  }
-
-  // Top 10 chart
   const chartData = (contracts || [])
     .filter(c => c.StageName === 'Closed Won' && c.ARR > 0)
     .sort((a, b) => b.ARR - a.ARR)
     .slice(0, 10)
     .map(c => ({ name: c.AccountName || c.DealName, arr: c.ARR }))
 
-  if (loading) return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--muted)' }}>
-      Loading…
-    </div>
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(key); setSortDir('desc') }
+  }
+
+  // Still checking auth
+  if (authed === null) return <Centered>Checking session…</Centered>
+
+  // Not logged in — show login screen
+  if (!authed) return (
+    <Centered>
+      <div style={{ textAlign: 'center' }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>ARR Tracker</h1>
+        <p style={{ color: 'var(--muted)', marginBottom: 28 }}>Sign in with your Salesforce account to continue</p>
+        <a href="/auth/login" style={{
+          display: 'inline-block',
+          background: 'var(--accent)',
+          color: '#fff',
+          padding: '10px 28px',
+          borderRadius: 8,
+          fontWeight: 600,
+          fontSize: 14,
+          textDecoration: 'none',
+        }}>
+          Login with Salesforce
+        </a>
+      </div>
+    </Centered>
   )
+
+  if (loading) return <Centered>Loading…</Centered>
 
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto', padding: '24px 20px' }}>
@@ -94,7 +129,7 @@ export default function App() {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 32 }}>
         <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: 'var(--text)' }}>ARR Tracker</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 700 }}>ARR Tracker</h1>
           <p style={{ color: 'var(--muted)', fontSize: 12, marginTop: 2 }}>
             Salesforce · {summary?.LastSyncAt ? `Last synced ${new Date(summary.LastSyncAt).toLocaleString()}` : 'Never synced'}
           </p>
@@ -107,6 +142,9 @@ export default function App() {
           <button onClick={() => doSync(true)} disabled={syncing} style={btnStyle('var(--border)')}>
             Full Sync
           </button>
+          <a href="/auth/logout" style={{ ...btnStyle('transparent'), textDecoration: 'none', color: 'var(--muted)' }}>
+            Logout
+          </a>
         </div>
       </div>
 
@@ -114,7 +152,7 @@ export default function App() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 32 }}>
         <Card label="Total ARR" value={fmt(summary?.TotalARR || 0)} />
         <Card label="MRR" value={fmt(summary?.TotalMRR || 0)} />
-        <Card label="Net Delta ARR" value={fmt(summary?.TotalDeltaARR || 0)} accent={summary?.TotalDeltaARR >= 0 ? 'var(--green)' : 'var(--red)'} />
+        <Card label="Net Delta ARR" value={fmt(summary?.TotalDeltaARR || 0)} accent={(summary?.TotalDeltaARR || 0) >= 0 ? 'var(--green)' : 'var(--red)'} />
         <Card label="Contracts" value={(summary?.ContractCount || 0).toLocaleString()} />
       </div>
 
@@ -162,13 +200,8 @@ export default function App() {
                   { key: 'DeltaARR', label: 'Delta ARR' },
                   { key: 'CurrencyCode', label: 'Currency' },
                 ].map(col => (
-                  <th
-                    key={col.key}
-                    onClick={() => toggleSort(col.key)}
-                    style={thStyle(col.key === sortKey)}
-                  >
-                    {col.label}
-                    {col.key === sortKey && (sortDir === 'asc' ? ' ↑' : ' ↓')}
+                  <th key={col.key} onClick={() => toggleSort(col.key)} style={thStyle(col.key === sortKey)}>
+                    {col.label}{col.key === sortKey && (sortDir === 'asc' ? ' ↑' : ' ↓')}
                   </th>
                 ))}
               </tr>
@@ -182,18 +215,26 @@ export default function App() {
                   <td style={{ ...tdStyle, color: 'var(--muted)' }}>{c.CloseDate ? new Date(c.CloseDate).toLocaleDateString() : '—'}</td>
                   <td style={{ ...tdStyle, fontWeight: 600 }}>{fmt(c.ARR || 0)}</td>
                   <td style={{ ...tdStyle, color: (c.DeltaARR || 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                    {c.DeltaARR !== 0 ? fmt(c.DeltaARR || 0) : '—'}
+                    {c.DeltaARR ? fmt(c.DeltaARR) : '—'}
                   </td>
                   <td style={{ ...tdStyle, color: 'var(--muted)' }}>{c.CurrencyCode || 'USD'}</td>
                 </tr>
               ))}
               {filtered.length === 0 && (
-                <tr><td colSpan={7} style={{ ...tdStyle, textAlign: 'center', color: 'var(--muted)', padding: '40px' }}>No contracts found</td></tr>
+                <tr><td colSpan={7} style={{ ...tdStyle, textAlign: 'center', color: 'var(--muted)', padding: 40 }}>No contracts found</td></tr>
               )}
             </tbody>
           </table>
         </div>
       </div>
+    </div>
+  )
+}
+
+function Centered({ children }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--muted)' }}>
+      {children}
     </div>
   )
 }
@@ -217,41 +258,20 @@ function StageBadge({ stage }) {
 }
 
 const btnStyle = (bg) => ({
-  background: bg,
-  color: 'var(--text)',
-  border: '1px solid var(--border)',
-  borderRadius: 6,
-  padding: '7px 14px',
-  fontSize: 12,
-  fontWeight: 600,
-  cursor: 'pointer',
+  background: bg, color: 'var(--text)', border: '1px solid var(--border)',
+  borderRadius: 6, padding: '7px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
 })
 
 const searchStyle = {
-  background: 'var(--bg)',
-  border: '1px solid var(--border)',
-  borderRadius: 6,
-  padding: '6px 12px',
-  color: 'var(--text)',
-  fontSize: 12,
-  width: 240,
-  outline: 'none',
+  background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+  padding: '6px 12px', color: 'var(--text)', fontSize: 12, width: 240, outline: 'none',
 }
 
 const thStyle = (active) => ({
-  padding: '10px 14px',
-  textAlign: 'left',
-  fontSize: 11,
-  fontWeight: 700,
-  color: active ? 'var(--text)' : 'var(--muted)',
-  textTransform: 'uppercase',
-  letterSpacing: '0.05em',
-  cursor: 'pointer',
-  userSelect: 'none',
-  whiteSpace: 'nowrap',
+  padding: '10px 14px', textAlign: 'left', fontSize: 11,
+  fontWeight: 700, color: active ? 'var(--text)' : 'var(--muted)',
+  textTransform: 'uppercase', letterSpacing: '0.05em',
+  cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
 })
 
-const tdStyle = {
-  padding: '10px 14px',
-  fontSize: 13,
-}
+const tdStyle = { padding: '10px 14px', fontSize: 13 }

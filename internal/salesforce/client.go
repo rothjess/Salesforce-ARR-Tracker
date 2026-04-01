@@ -11,22 +11,21 @@ import (
 	"time"
 )
 
-// Config holds Salesforce OAuth credentials (Username-Password flow).
+// Config holds Salesforce OAuth Web Server flow credentials.
 type Config struct {
 	ClientID     string
 	ClientSecret string
-	Username     string
-	// Password should already have the security token appended: password+token
-	Password    string
-	InstanceURL string
+	CallbackURL  string
+	InstanceURL  string // e.g. https://login.salesforce.com or https://test.salesforce.com
 }
 
-// Client is a minimal Salesforce REST API client.
+// Client is a Salesforce REST API client bound to a specific user's tokens.
 type Client struct {
-	cfg         Config
-	httpClient  *http.Client
-	accessToken string
-	apiBase     string // e.g. https://yourorg.my.salesforce.com
+	cfg          Config
+	httpClient   *http.Client
+	AccessToken  string
+	RefreshToken string
+	APIBase      string // e.g. https://yourorg.my.salesforce.com
 }
 
 func New(cfg Config) *Client {
@@ -36,53 +35,79 @@ func New(cfg Config) *Client {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
-
-type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	InstanceURL string `json:"instance_url"`
-	TokenType   string `json:"token_type"`
+// NewWithTokens creates a Client already loaded with user tokens.
+func NewWithTokens(cfg Config, accessToken, refreshToken, apiBase string) *Client {
+	return &Client{
+		cfg:          cfg,
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		APIBase:      apiBase,
+	}
 }
 
-func (c *Client) authenticate() error {
+// ---------------------------------------------------------------------------
+// OAuth Web Server Flow
+// ---------------------------------------------------------------------------
+
+// AuthCodeURL returns the Salesforce authorization URL to redirect the user to.
+func (c *Client) AuthCodeURL(state string) string {
+	params := url.Values{}
+	params.Set("response_type", "code")
+	params.Set("client_id", c.cfg.ClientID)
+	params.Set("redirect_uri", c.cfg.CallbackURL)
+	params.Set("state", state)
+	return c.cfg.InstanceURL + "/services/oauth2/authorize?" + params.Encode()
+}
+
+// TokenResponse holds the token exchange response from Salesforce.
+type TokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	InstanceURL  string `json:"instance_url"`
+	TokenType    string `json:"token_type"`
+	IssuedAt     string `json:"issued_at"`
+}
+
+// ExchangeCode exchanges an authorization code for access + refresh tokens.
+func (c *Client) ExchangeCode(code string) (*TokenResponse, error) {
 	data := url.Values{}
-	data.Set("grant_type", "password")
+	data.Set("grant_type", "authorization_code")
 	data.Set("client_id", c.cfg.ClientID)
 	data.Set("client_secret", c.cfg.ClientSecret)
-	data.Set("username", c.cfg.Username)
-	data.Set("password", c.cfg.Password)
+	data.Set("redirect_uri", c.cfg.CallbackURL)
+	data.Set("code", code)
+	return c.postToken(data)
+}
 
+// RefreshAccessToken uses the refresh token to get a new access token.
+func (c *Client) RefreshAccessToken(refreshToken string) (*TokenResponse, error) {
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("client_id", c.cfg.ClientID)
+	data.Set("client_secret", c.cfg.ClientSecret)
+	data.Set("refresh_token", refreshToken)
+	return c.postToken(data)
+}
+
+func (c *Client) postToken(data url.Values) (*TokenResponse, error) {
 	tokenURL := c.cfg.InstanceURL + "/services/oauth2/token"
 	resp, err := c.httpClient.PostForm(tokenURL, data)
 	if err != nil {
-		return fmt.Errorf("oauth token request failed: %w", err)
+		return nil, fmt.Errorf("token request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("oauth error %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("token error %d: %s", resp.StatusCode, body)
 	}
 
-	var tr tokenResponse
+	var tr TokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return fmt.Errorf("parsing token response: %w", err)
+		return nil, fmt.Errorf("parsing token response: %w", err)
 	}
-
-	c.accessToken = tr.AccessToken
-	c.apiBase = tr.InstanceURL
-	log.Printf("Salesforce authenticated, instance: %s", c.apiBase)
-	return nil
-}
-
-// ensureAuth authenticates if we don't have a token yet.
-func (c *Client) ensureAuth() error {
-	if c.accessToken == "" {
-		return c.authenticate()
-	}
-	return nil
+	return &tr, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -92,21 +117,17 @@ func (c *Client) ensureAuth() error {
 type queryResponse[T any] struct {
 	TotalSize int    `json:"totalSize"`
 	Done      bool   `json:"done"`
-	Records   []T    `json:"records"`
 	NextURL   string `json:"nextRecordsUrl"`
+	Records   []T    `json:"records"`
 }
 
-func query[T any](c *Client, soql string) ([]T, error) {
-	if err := c.ensureAuth(); err != nil {
-		return nil, err
-	}
-
-	endpoint := c.apiBase + "/services/data/v59.0/query?q=" + url.QueryEscape(soql)
+func queryWith[T any](c *Client, soql string) ([]T, error) {
+	endpoint := c.APIBase + "/services/data/v59.0/query?q=" + url.QueryEscape(soql)
 	var all []T
 
 	for endpoint != "" {
 		req, _ := http.NewRequest("GET", endpoint, nil)
-		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := c.httpClient.Do(req)
@@ -116,12 +137,13 @@ func query[T any](c *Client, soql string) ([]T, error) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		// Re-auth once on 401
-		if resp.StatusCode == http.StatusUnauthorized {
-			c.accessToken = ""
-			if err := c.authenticate(); err != nil {
-				return nil, err
+		// Try to refresh once on 401
+		if resp.StatusCode == http.StatusUnauthorized && c.RefreshToken != "" {
+			tr, err := c.RefreshAccessToken(c.RefreshToken)
+			if err != nil {
+				return nil, fmt.Errorf("token refresh failed: %w", err)
 			}
+			c.AccessToken = tr.AccessToken
 			continue
 		}
 
@@ -138,7 +160,7 @@ func query[T any](c *Client, soql string) ([]T, error) {
 		if page.Done || page.NextURL == "" {
 			break
 		}
-		endpoint = c.apiBase + page.NextURL
+		endpoint = c.APIBase + page.NextURL
 	}
 
 	return all, nil
@@ -148,66 +170,35 @@ func query[T any](c *Client, soql string) ([]T, error) {
 // Domain types
 // ---------------------------------------------------------------------------
 
-// OpportunityRecord maps to a Salesforce Opportunity row returned by SOQL.
-type OpportunityRecord struct {
-	ID          string     `json:"Id"`
-	Name        string     `json:"Name"`
-	AccountName string     `json:"-"` // populated from nested Account
-	AccountObj  *sfAccount `json:"Account"`
-	StageName   string     `json:"StageName"`
-	CloseDate   string     `json:"CloseDate"`
-	CreatedDate string     `json:"CreatedDate"`
-	// ARR__c lives directly on the opportunity
-	ARR *float64 `json:"ARR__c"`
-	// CurrencyIsoCode present when multi-currency is enabled
-	CurrencyIsoCode string `json:"CurrencyIsoCode"`
-}
-
 type sfAccount struct {
 	Name string `json:"Name"`
 }
 
-// QuoteLineItemRecord maps to SFDC QuoteLineItem rows.
-type QuoteLineItemRecord struct {
-	ID string `json:"Id"`
-	// Ruby__DeltaARR__c is the ARR delta field on quote line items
-	DeltaARR *float64 `json:"Ruby__DeltaARR__c"`
-	// Link back to opportunity via Quote
-	QuoteObj *sfQuote `json:"Quote"`
-}
-
-type sfQuote struct {
-	OpportunityID string `json:"OpportunityId"`
-}
-
-// Contract is our unified domain object stored in Postgres.
+// Contract is the unified domain object stored in Postgres.
 type Contract struct {
 	SalesforceID   string
 	AccountName    string
 	DealName       string
 	StageName      string
 	CloseDate      *time.Time
-	ARR            float64 // from Opportunity.ARR__c
-	DeltaARR       float64 // sum of QuoteLineItem.Ruby__DeltaARR__c
+	ARR            float64
+	DeltaARR       float64
 	CurrencyCode   string
 	LastModifiedAt time.Time
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Data fetching
 // ---------------------------------------------------------------------------
 
-// FetchOpportunities returns all Closed Won opportunities with ARR data.
-// If sinceTime is non-zero, only records modified after that time are returned.
-func (c *Client) FetchOpportunities(sinceTime time.Time) ([]Contract, error) {
-	var soql string
-
+// FetchOpportunities returns Closed Won opportunities with ARR data.
+func FetchOpportunities(c *Client, sinceTime time.Time) ([]Contract, error) {
 	baseFields := strings.Join([]string{
 		"Id", "Name", "Account.Name", "StageName",
-		"CloseDate", "CreatedDate", "ARR__c", "CurrencyIsoCode",
-		"LastModifiedDate",
+		"CloseDate", "ARR__c", "CurrencyIsoCode", "LastModifiedDate",
 	}, ", ")
 
+	var soql string
 	if sinceTime.IsZero() {
 		soql = fmt.Sprintf(
 			"SELECT %s FROM Opportunity WHERE StageName = 'Closed Won' ORDER BY LastModifiedDate DESC",
@@ -232,13 +223,12 @@ func (c *Client) FetchOpportunities(sinceTime time.Time) ([]Contract, error) {
 		LastModifiedDate string     `json:"LastModifiedDate"`
 	}
 
-	opps, err := query[rawOpp](c, soql)
+	opps, err := queryWith[rawOpp](c, soql)
 	if err != nil {
 		return nil, fmt.Errorf("fetching opportunities: %w", err)
 	}
 
-	// Build a map for DeltaARR sums (keyed by OpportunityId)
-	deltaByOpp, err := c.fetchDeltaARR(sinceTime)
+	deltaByOpp, err := fetchDeltaARR(c, sinceTime)
 	if err != nil {
 		log.Printf("WARN: could not fetch QuoteLineItem DeltaARR: %v", err)
 		deltaByOpp = map[string]float64{}
@@ -285,8 +275,7 @@ func (c *Client) FetchOpportunities(sinceTime time.Time) ([]Contract, error) {
 	return contracts, nil
 }
 
-// fetchDeltaARR queries QuoteLineItems and sums Ruby__DeltaARR__c by OpportunityId.
-func (c *Client) fetchDeltaARR(sinceTime time.Time) (map[string]float64, error) {
+func fetchDeltaARR(c *Client, sinceTime time.Time) (map[string]float64, error) {
 	var soql string
 	if sinceTime.IsZero() {
 		soql = "SELECT Id, Ruby__DeltaARR__c, Quote.OpportunityId FROM QuoteLineItem WHERE Quote.Opportunity.StageName = 'Closed Won'"
@@ -305,7 +294,7 @@ func (c *Client) fetchDeltaARR(sinceTime time.Time) (map[string]float64, error) 
 		} `json:"Quote"`
 	}
 
-	items, err := query[rawQLI](c, soql)
+	items, err := queryWith[rawQLI](c, soql)
 	if err != nil {
 		return nil, err
 	}
